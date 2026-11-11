@@ -76,8 +76,12 @@ class Settings {
 class Notifier {
   static final _plugin = FlutterLocalNotificationsPlugin();
 
-  // تعداد نوتیفیکیشن‌هایی که از قبل زمان‌بندی می‌شود (کم نگه داشته شده تا برنامه کند نشود)
+  // تعداد نوتیفیکیشن‌هایی که از قبل زمان‌بندی می‌شود
   static const batchSize = 60;
+
+  static AndroidFlutterLocalNotificationsPlugin? get _android =>
+      _plugin.resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>();
 
   static Future<void>? _initFuture;
   static Future<void> init() => _initFuture ??= _init();
@@ -86,10 +90,7 @@ class Notifier {
     tzdata.initializeTimeZones();
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     await _plugin.initialize(const InitializationSettings(android: android));
-    await _plugin
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.requestNotificationsPermission();
+    await _android?.requestNotificationsPermission();
   }
 
   static NotificationDetails _details(String body) => NotificationDetails(
@@ -106,6 +107,25 @@ class Notifier {
   static String _title(Ayah a) => '${a.surah} - آیه ${a.no}';
   static String _body(Ayah a) => '${a.ar}\n\n${a.fa}';
 
+  // ---------- وضعیت (برای نمایش در تنظیمات) ----------
+
+  static Future<bool> allowed() async {
+    await init();
+    return await _android?.areNotificationsEnabled() ?? true;
+  }
+
+  static Future<void> askPermission() async {
+    await init();
+    await _android?.requestNotificationsPermission();
+  }
+
+  static Future<int> pendingCount() async {
+    await init();
+    return (await _plugin.pendingNotificationRequests()).length;
+  }
+
+  // ---------- ارسال و زمان‌بندی ----------
+
   static Future<void> showNow(Settings s) async {
     await init();
     final a = s.random
@@ -114,15 +134,16 @@ class Notifier {
     await _plugin.show(9999, _title(a), _body(a), _details(_body(a)));
   }
 
-  static Future<void> _zoned(int id, Ayah a, DateTime when) async {
-    final details = _details(_body(a));
+  static Future<void> _zoned(
+      int id, String title, String body, DateTime when) async {
+    final details = _details(body);
     final date = tz.TZDateTime.from(when, tz.UTC);
     try {
       // آلارم دقیق (برای رسیدن به‌موقع در گوشی‌هایی مثل شیائومی)
       await _plugin.zonedSchedule(
         id,
-        _title(a),
-        _body(a),
+        title,
+        body,
         date,
         details,
         androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
@@ -133,8 +154,8 @@ class Notifier {
       // اگر اجازه آلارم دقیق نبود، حالت تقریبی
       await _plugin.zonedSchedule(
         id,
-        _title(a),
-        _body(a),
+        title,
+        body,
         date,
         details,
         androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
@@ -172,8 +193,19 @@ class Notifier {
       final idx = s.random
           ? Random(s.startMs + n).nextInt(allAyahs.length)
           : (s.startIndex + n - 1) % allAyahs.length;
-      await _zoned(i, allAyahs[idx], when);
+      final a = allAyahs[idx];
+      await _zoned(i, _title(a), _body(a), when);
     }
+
+    // آخرین نوتیفیکیشن: یادآوری برای باز کردن برنامه تا دسته بعدی ساخته شود
+    final endWhen =
+        start.add(Duration(minutes: s.minutes * (first + batchSize)));
+    await _zoned(
+      batchSize,
+      'برای ادامه آیات، برنامه را باز کنید',
+      'نوتیفیکیشن‌های از پیش تنظیم‌شده تمام شد. یک‌بار برنامه را باز کنید تا ادامه پیدا کند.',
+      endWhen,
+    );
   }
 }
 
@@ -350,22 +382,49 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _enabled = false;
   bool _random = true;
   bool _loaded = false;
+  bool _busy = false;
+  bool _allowed = true;
+  int _pending = 0;
 
   @override
   void initState() {
     super.initState();
     Settings.load().then((s) {
+      if (!mounted) return;
       setState(() {
         _enabled = s.enabled;
         _random = s.random;
         _ctrl.text = '${s.minutes}';
         _loaded = true;
       });
+      _refreshStatus();
     });
   }
 
-  void _snack(String msg) =>
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _refreshStatus() async {
+    try {
+      final allowed = await Notifier.allowed();
+      final pending = await Notifier.pendingCount();
+      if (!mounted) return;
+      setState(() {
+        _allowed = allowed;
+        _pending = pending;
+      });
+    } catch (e) {
+      debugPrint('status error: $e');
+    }
+  }
 
   Future<void> _save() async {
     final m = int.tryParse(_ctrl.text.trim());
@@ -373,40 +432,79 @@ class _SettingsPageState extends State<SettingsPage> {
       _snack('یک عدد معتبر (حداقل ۱ دقیقه) وارد کنید');
       return;
     }
-    final old = await Settings.load();
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    // ادامه از همان جایی که ترتیب آیات رسیده بود
-    var startIndex = old.startIndex;
-    if (old.enabled && old.startMs > 0) {
-      final passed = (now - old.startMs) ~/ (old.minutes * 60 * 1000);
-      startIndex = (old.startIndex + passed) % allAyahs.length;
-    }
-
-    final s = Settings(
-      enabled: _enabled,
-      minutes: m,
-      random: _random,
-      startMs: now,
-      startIndex: startIndex,
-    );
-    await s.save();
+    setState(() => _busy = true);
     try {
+      final old = await Settings.load();
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      // ادامه از همان جایی که ترتیب آیات رسیده بود
+      var startIndex = old.startIndex;
+      if (old.enabled && old.startMs > 0) {
+        final passed = (now - old.startMs) ~/ (old.minutes * 60 * 1000);
+        startIndex = (old.startIndex + passed) % allAyahs.length;
+      }
+
+      final s = Settings(
+        enabled: _enabled,
+        minutes: m,
+        random: _random,
+        startMs: now,
+        startIndex: startIndex,
+      );
+      await s.save();
       await Notifier.reschedule(s, force: true);
       _snack(_enabled
           ? 'ذخیره شد؛ هر $m دقیقه یک آیه می‌آید'
           : 'ذخیره شد؛ نوتیفیکیشن خاموش است');
     } catch (e) {
       _snack('خطا در زمان‌بندی: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      _refreshStatus();
+    }
+  }
+
+  Future<void> _test() async {
+    try {
+      final s = await Settings.load();
+      await Notifier.showNow(s);
+    } catch (e) {
+      _snack('خطا: $e');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     if (!_loaded) return const Center(child: CircularProgressIndicator());
+    final scheme = Theme.of(context).colorScheme;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        // وضعیت نوتیفیکیشن
+        Card(
+          color: _allowed ? scheme.secondaryContainer : scheme.errorContainer,
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: _allowed
+                ? Text('نوتیفیکیشن‌های زمان‌بندی‌شده: $_pending')
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                          'اجازه نوتیفیکیشن داده نشده است؛ بدون آن آیه‌ای نمایش داده نمی‌شود.'),
+                      const SizedBox(height: 8),
+                      FilledButton(
+                        onPressed: () async {
+                          await Notifier.askPermission();
+                          _refreshStatus();
+                        },
+                        child: const Text('درخواست اجازه نوتیفیکیشن'),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+        const SizedBox(height: 8),
         SwitchListTile(
           title: const Text('ارسال نوتیفیکیشن آیه'),
           value: _enabled,
@@ -433,22 +531,24 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
         SwitchListTile(
           title: const Text('انتخاب تصادفی آیه'),
-          subtitle: const Text('در حالت خاموش، آیات پشت سر هم و به ترتیب قرآن می‌آیند'),
+          subtitle: const Text(
+              'در حالت خاموش، آیات پشت سر هم و به ترتیب قرآن می‌آیند'),
           value: _random,
           onChanged: (v) => setState(() => _random = v),
         ),
         const SizedBox(height: 16),
-        FilledButton(onPressed: _save, child: const Text('ذخیره تنظیمات')),
+        FilledButton(
+          onPressed: _busy ? null : _save,
+          child: _busy
+              ? const SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2))
+              : const Text('ذخیره تنظیمات'),
+        ),
         const SizedBox(height: 8),
         OutlinedButton(
-          onPressed: () async {
-            try {
-              final s = await Settings.load();
-              await Notifier.showNow(s);
-            } catch (e) {
-              _snack('خطا: $e');
-            }
-          },
+          onPressed: _test,
           child: const Text('تست: همین الان یک نوتیفیکیشن بفرست'),
         ),
       ],
