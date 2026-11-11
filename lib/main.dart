@@ -76,10 +76,13 @@ class Settings {
 class Notifier {
   static final _plugin = FlutterLocalNotificationsPlugin();
 
-  // چند نوتیفیکیشن بعدی از قبل زمان‌بندی می‌شود (محدودیت آلارم اندروید ~۵۰۰ است)
-  static const batchSize = 200;
+  // تعداد نوتیفیکیشن‌هایی که از قبل زمان‌بندی می‌شود (کم نگه داشته شده تا برنامه کند نشود)
+  static const batchSize = 60;
 
-  static Future<void> init() async {
+  static Future<void>? _initFuture;
+  static Future<void> init() => _initFuture ??= _init();
+
+  static Future<void> _init() async {
     tzdata.initializeTimeZones();
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     await _plugin.initialize(const InitializationSettings(android: android));
@@ -104,16 +107,59 @@ class Notifier {
   static String _body(Ayah a) => '${a.ar}\n\n${a.fa}';
 
   static Future<void> showNow(Settings s) async {
+    await init();
     final a = s.random
         ? allAyahs[Random().nextInt(allAyahs.length)]
         : allAyahs[s.startIndex % allAyahs.length];
     await _plugin.show(9999, _title(a), _body(a), _details(_body(a)));
   }
 
-  /// نوتیفیکیشن‌های آینده را از نو زمان‌بندی می‌کند.
-  static Future<void> reschedule(Settings s) async {
+  static Future<void> _zoned(int id, Ayah a, DateTime when) async {
+    final details = _details(_body(a));
+    final date = tz.TZDateTime.from(when, tz.UTC);
+    try {
+      // آلارم دقیق (برای رسیدن به‌موقع در گوشی‌هایی مثل شیائومی)
+      await _plugin.zonedSchedule(
+        id,
+        _title(a),
+        _body(a),
+        date,
+        details,
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
+      );
+    } catch (_) {
+      // اگر اجازه آلارم دقیق نبود، حالت تقریبی
+      await _plugin.zonedSchedule(
+        id,
+        _title(a),
+        _body(a),
+        date,
+        details,
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
+      );
+    }
+  }
+
+  /// نوتیفیکیشن‌های آینده را زمان‌بندی می‌کند.
+  /// force=false: فقط وقتی تعداد باقی‌مانده کم شده باشد دوباره می‌سازد.
+  static Future<void> reschedule(Settings s, {bool force = false}) async {
+    await init();
+
+    if (!s.enabled || s.startMs == 0) {
+      await _plugin.cancelAll();
+      return;
+    }
+
+    if (!force) {
+      final pending = await _plugin.pendingNotificationRequests();
+      if (pending.length >= batchSize ~/ 2) return;
+    }
+
     await _plugin.cancelAll();
-    if (!s.enabled || s.startMs == 0) return;
 
     final start = DateTime.fromMillisecondsSinceEpoch(s.startMs);
     final intervalMs = s.minutes * 60 * 1000;
@@ -126,17 +172,7 @@ class Notifier {
       final idx = s.random
           ? Random(s.startMs + n).nextInt(allAyahs.length)
           : (s.startIndex + n - 1) % allAyahs.length;
-      final a = allAyahs[idx];
-      await _plugin.zonedSchedule(
-        i,
-        _title(a),
-        _body(a),
-        tz.TZDateTime.from(when, tz.UTC),
-        _details(_body(a)),
-        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-        uiLocalNotificationDateInterpretation:
-            UILocalNotificationDateInterpretation.absoluteTime,
-      );
+      await _zoned(i, allAyahs[idx], when);
     }
   }
 }
@@ -150,11 +186,19 @@ Future<void> main() async {
       .map((e) => Ayah.fromJson(e as Map<String, dynamic>))
       .toList();
 
-  await Notifier.init();
-  // هر بار باز شدن برنامه، دسته نوتیفیکیشن‌های آینده تمدید می‌شود
-  await Notifier.reschedule(await Settings.load());
-
   runApp(const QuranApp());
+
+  // بعد از نمایش برنامه، بدون انتظار و بدون اینکه خطا برنامه را بخواباند
+  _setupNotifications();
+}
+
+Future<void> _setupNotifications() async {
+  try {
+    await Notifier.init();
+    await Notifier.reschedule(await Settings.load());
+  } catch (e) {
+    debugPrint('notification setup error: $e');
+  }
 }
 
 class QuranApp extends StatelessWidget {
@@ -347,10 +391,14 @@ class _SettingsPageState extends State<SettingsPage> {
       startIndex: startIndex,
     );
     await s.save();
-    await Notifier.reschedule(s);
-    _snack(_enabled
-        ? 'ذخیره شد؛ هر $m دقیقه یک آیه می‌آید'
-        : 'ذخیره شد؛ نوتیفیکیشن خاموش است');
+    try {
+      await Notifier.reschedule(s, force: true);
+      _snack(_enabled
+          ? 'ذخیره شد؛ هر $m دقیقه یک آیه می‌آید'
+          : 'ذخیره شد؛ نوتیفیکیشن خاموش است');
+    } catch (e) {
+      _snack('خطا در زمان‌بندی: $e');
+    }
   }
 
   @override
@@ -394,8 +442,12 @@ class _SettingsPageState extends State<SettingsPage> {
         const SizedBox(height: 8),
         OutlinedButton(
           onPressed: () async {
-            final s = await Settings.load();
-            await Notifier.showNow(s);
+            try {
+              final s = await Settings.load();
+              await Notifier.showNow(s);
+            } catch (e) {
+              _snack('خطا: $e');
+            }
           },
           child: const Text('تست: همین الان یک نوتیفیکیشن بفرست'),
         ),
