@@ -42,9 +42,20 @@ jobs:
         working-directory: build_app
         run: |
           flutter pub get
-          flutter build apk --release
+          flutter build apk --release --no-shrink
+
+      - name: Verify APK is not obfuscated (Gson TypeToken must survive)
+        run: |
+          mkdir -p /tmp/apkcheck
+          unzip -o -q build_app/build/app/outputs/flutter-apk/app-release.apk 'classes*.dex' -d /tmp/apkcheck
+          if grep -a -q "Lcom/google/gson/reflect/TypeToken;" /tmp/apkcheck/classes*.dex; then
+            echo "OK: APK is safe (TypeToken class kept)"
+          else
+            echo "ERROR: R8 obfuscated Gson -> notifications would crash with 'Missing type parameter'"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: quran-apk
+          name: quran-apk-run${{ github.run_number }}
           path: build_app/build/app/outputs/flutter-apk/app-release.apk
