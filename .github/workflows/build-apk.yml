@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -59,3 +62,17 @@ jobs:
         with:
           name: quran-apk-run${{ github.run_number }}
           path: build_app/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish APK to apk-build branch
+        run: |
+          mkdir -p /tmp/apkout
+          cp build_app/build/app/outputs/flutter-apk/app-release.apk /tmp/apkout/quran.apk
+          cd /tmp/apkout
+          git init -q
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout -q -b apk-build
+          git add quran.apk
+          git commit -q -m "APK from run ${{ github.run_number }}"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -f origin apk-build
